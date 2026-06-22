@@ -5075,6 +5075,7 @@ public class Client {
     org.tron.walletcli.cli.commands.WitnessCommands.register(registry);
     org.tron.walletcli.cli.commands.ProposalCommands.register(registry);
     org.tron.walletcli.cli.commands.ExchangeCommands.register(registry);
+    org.tron.walletcli.cli.commands.AliasCommands.register(registry);
     org.tron.walletcli.cli.commands.WalletCommands.register(registry);
     org.tron.walletcli.cli.commands.MiscCommands.register(registry);
     return registry;
