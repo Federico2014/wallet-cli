@@ -17,17 +17,16 @@ package org.tron.common.utils;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-import java.security.SignatureException;
-import java.util.Arrays;
-import java.util.List;
 import java.util.Scanner;
 import org.bouncycastle.util.encoders.Hex;
-import org.tron.common.crypto.ECKey;
-import org.tron.common.crypto.ECKey.ECDSASignature;
 import org.tron.common.crypto.Sha256Sm3Hash;
 import org.tron.common.crypto.SignInterface;
 import org.tron.common.crypto.SignatureInterface;
+import org.tron.common.crypto.pqc.PQSchemeRegistry;
+import org.tron.common.crypto.pqc.PQSignature;
 import org.tron.core.exception.CancelException;
+import org.tron.protos.Protocol.PQAuthSig;
+import org.tron.protos.Protocol.PQScheme;
 import org.tron.protos.Protocol.Transaction;
 import org.tron.protos.contract.AccountContract;
 import org.tron.protos.contract.AccountContract.AccountCreateContract;
@@ -53,6 +52,21 @@ import org.tron.trident.proto.Chain;
 
 public class TransactionUtils {
   private static final ThreadLocal<Integer> PERMISSION_ID_OVERRIDE = new ThreadLocal<>();
+
+  // Protobuf field number of Transaction.pq_auth_sig (Tron.proto). The Trident
+  // SDK's Chain.Transaction does not define this field, so on those objects PQ
+  // auth signatures are preserved only as unknown field 6.
+  // TODO(trident-pq): once the Trident SDK models pq_auth_sig on
+  // Chain.Transaction, drop this constant and use the generated accessors.
+  private static final int PQ_AUTH_SIG_FIELD_NUMBER = 6;
+
+  /** True if the (possibly Trident-typed) transaction carries any PQ auth signature. */
+  // TODO(trident-pq): replace the unknown-field probe with
+  // transaction.getPqAuthSigCount() > 0 when Trident's Chain.Transaction
+  // exposes pq_auth_sig natively.
+  private static boolean hasPqAuthSig(Chain.Transaction transaction) {
+    return transaction.getUnknownFields().hasField(PQ_AUTH_SIG_FIELD_NUMBER);
+  }
 
   /**
    * Obtain a data bytes after removing the id and SHA-256(data)
@@ -291,50 +305,6 @@ public class TransactionUtils {
     }
   }
 
-  public static String getBase64FromByteString(ByteString sign) {
-    byte[] r = sign.substring(0, 32).toByteArray();
-    byte[] s = sign.substring(32, 64).toByteArray();
-    byte v = sign.byteAt(64);
-    if (v < 27) {
-      v += 27; // revId -> v
-    }
-    ECDSASignature signature = ECDSASignature.fromComponents(r, s, v);
-    return signature.toBase64();
-  }
-
-  /*
-   * 1. check hash
-   * 2. check double spent
-   * 3. check sign
-   * 4. check balance
-   */
-  public static boolean validTransaction(Transaction signedTransaction) {
-    assert (signedTransaction.getSignatureCount()
-        == signedTransaction.getRawData().getContractCount());
-    List<Transaction.Contract> listContract = signedTransaction.getRawData().getContractList();
-    byte[] hash = Sha256Sm3Hash.hash(signedTransaction.getRawData().toByteArray());
-    int count = signedTransaction.getSignatureCount();
-    if (count == 0) {
-      return false;
-    }
-    for (int i = 0; i < count; ++i) {
-      try {
-        Transaction.Contract contract = listContract.get(i);
-        byte[] owner = getOwner(contract);
-        byte[] address =
-            ECKey.signatureToAddress(
-                hash, getBase64FromByteString(signedTransaction.getSignature(i)));
-        if (!Arrays.equals(owner, address)) {
-          return false;
-        }
-      } catch (SignatureException e) {
-        e.printStackTrace();
-        return false;
-      }
-    }
-    return true;
-  }
-
   public static Chain.Transaction sign(Chain.Transaction transaction, SignInterface myKey)
       throws InvalidProtocolBufferException {
     return Chain.Transaction.parseFrom(
@@ -349,6 +319,34 @@ public class TransactionUtils {
     transactionBuilderSigned.addSignature(bsSign);
     transaction = transactionBuilderSigned.build();
     return transaction;
+  }
+
+  // TODO(trident-pq): this Chain<->Protocol byte round-trip only exists because
+  // Trident's Chain.Transaction cannot carry pq_auth_sig. Drop the conversion
+  // and add the PQAuthSig directly once Trident models the field.
+  public static Chain.Transaction signPQ(
+      Chain.Transaction transaction, PQSignature signer, PQScheme scheme)
+      throws InvalidProtocolBufferException {
+    return Chain.Transaction.parseFrom(
+        signPQ(Transaction.parseFrom(transaction.toByteArray()), signer, scheme).toByteArray());
+  }
+
+  public static Transaction signPQ(Transaction transaction, PQSignature signer, PQScheme scheme) {
+    if (!PQSchemeRegistry.contains(scheme)) {
+      throw new IllegalArgumentException("Unsupported or unknown PQScheme: " + scheme);
+    }
+    if (signer.getScheme() != scheme) {
+      throw new IllegalArgumentException("Signer scheme " + signer.getScheme()
+          + " does not match requested scheme " + scheme);
+    }
+    byte[] hash = Sha256Sm3Hash.hash(transaction.getRawData().toByteArray());
+    byte[] sig = signer.sign(hash);
+    PQAuthSig pqSig = PQAuthSig.newBuilder()
+        .setScheme(scheme)
+        .setPublicKey(ByteString.copyFrom(signer.getPublicKey()))
+        .setSignature(ByteString.copyFrom(sig))
+        .build();
+    return transaction.toBuilder().addPqAuthSig(pqSig).build();
   }
 
   public static Transaction setTimestamp(Transaction transaction) {
@@ -372,8 +370,13 @@ public class TransactionUtils {
   }
 
   public static Chain.Transaction setExpirationTime(Chain.Transaction transaction, boolean multi) {
-    if (transaction.getSignatureCount() == 0) {
-      long expirationTime = System.currentTimeMillis() + (multi ? 24L * 3600 * 1000 : 6 * 60 * 60 * 1000);
+    // Both ECDSA signatures and PQ auth signatures cover raw_data (the
+    // expiration lives there), so refuse to rewrite expiration once EITHER kind
+    // of signature is attached — otherwise an already-attached pq_auth_sig is
+    // silently invalidated (txid changes -> SIGERROR on broadcast).
+    if (transaction.getSignatureCount() == 0 && !hasPqAuthSig(transaction)) {
+      long expirationTime =
+          System.currentTimeMillis() + (multi ? 24L * 3600 * 1000 : 6 * 60 * 60 * 1000);
       Chain.Transaction.Builder builder = transaction.toBuilder();
       Chain.Transaction.raw.Builder rowBuilder =
           transaction.getRawData().toBuilder();
@@ -384,6 +387,10 @@ public class TransactionUtils {
     return transaction;
   }
 
+  // TODO(trident-pq): the Chain<->Protocol byte round-trip is only needed to
+  // preserve pq_auth_sig (and read getPqAuthSigCount() in the Protocol overload)
+  // because Trident's Chain.Transaction lacks the field. Simplify once Trident
+  // models pq_auth_sig.
   public static Chain.Transaction setPermissionId(Chain.Transaction transaction, String tipString)
       throws CancelException, InvalidProtocolBufferException {
     return Chain.Transaction.parseFrom(
@@ -392,7 +399,11 @@ public class TransactionUtils {
 
   public static Transaction setPermissionId(Transaction transaction, String tipString)
       throws CancelException {
+    // Changing permissionId mutates raw_data, which would invalidate any
+    // already-attached signature — including PQ auth signatures, which do not
+    // bump getSignatureCount(). Bail out if either kind is present.
     if (transaction.getSignatureCount() != 0
+        || transaction.getPqAuthSigCount() != 0
         || transaction.getRawData().getContract(0).getPermissionId() != 0) {
       return transaction;
     }
